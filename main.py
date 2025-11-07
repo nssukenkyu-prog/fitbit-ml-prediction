@@ -252,6 +252,9 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
 # ML予測処理（変更なし）
 # =================================================================
 
+# =================================================================
+# ML予測処理（★ 5分間隔 修正版 ★）
+# =================================================================
 def predict_for_single_user(ss, user_sheet_name, target_date_str):
     """
     単一ユーザーの単一日付に対してML予測を実行する
@@ -312,8 +315,12 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             model = RandomForestRegressor(n_estimators=100, random_state=42)
             model.fit(X, y)
             
-            bedtimes = np.arange(-180, 120 + 15, 15)
-            times_in_bed = np.arange(360, 540 + 15, 15)
+            # ★★★ ご要望⑥（推奨時間の粒度）の修正箇所 ★★★
+            # 5分間隔に変更
+            bedtimes = np.arange(-180, 120 + 5, 5)     # 21:00から02:00まで「5分」間隔
+            times_in_bed = np.arange(360, 540 + 5, 5) # 6時間から9時間まで「5分」間隔
+            print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
+            # ★★★
             
             grid = []
             for bt in bedtimes:
@@ -340,6 +347,8 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             recovery_score = calculate_recovery_score(df, today_hrv, today_rhr)
             trend_hrv, trend_deep = analyze_trends(df)
             key_factor = get_key_factor(model, features)
+            
+            # Plan B のシミュレーションは、計算負荷を減らすため15分間隔のままにします
             plan_b_bedtime, plan_b_waketime = simulate_plan_b(model, features, avg_features_for_pred, best_bedtime)
         
         pred_bedtime_str = format_minutes_to_time(best_bedtime)
