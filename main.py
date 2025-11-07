@@ -1,12 +1,10 @@
 """
-Fitbit睡眠最適化ML予測サービス (v2 - 安定版)
+Fitbit睡眠最適化ML予測サービス (v2.1 - 追加特徴量 対応版)
 Render.comで24時間稼働するFlaskアプリケーション
 
 変更点:
-- メモリ不足によるクラッシュを防ぐため、/predict が呼び出された際に
-  キュー(ML予測キュー)から1件だけ(pendingの最初の1件)を処理するように変更。
-- Cloud Scheduler (GCP) などで定期的に /predict を呼び出すことで、
-  キューに溜まったジョブを1件ずつ着実に処理する設計。
+- v2: メモリ不足対策として、キュー処理を1件ずつに変更。
+- v2.1: SpO2, 呼吸数(BR), 皮膚温(Temp)のデータを特徴量としてモデルに追加。
 """
 
 from flask import Flask, request, jsonify
@@ -55,7 +53,7 @@ def get_gspread_client():
         raise
 
 # =================================================================
-# ヘルパー関数（変更なし）
+# ヘルパー関数
 # =================================================================
 
 def get_sheet_data_as_df(ss, sheet_name):
@@ -92,6 +90,7 @@ def define_sleep_quality(df):
     quality = (efficiency_score * 0.5) + (time_score * 0.3) + (deep_score * 0.2)
     return quality.fillna(0)
 
+# ★★★ 修正箇所 (v2.1) ★★★
 def preprocess_data(ss, user_sheet_name):
     """ユーザーデータを読み込み、前処理と結合を行う"""
     sleep_df = get_sheet_data_as_df(ss, f"sleep_{user_sheet_name}")
@@ -101,11 +100,13 @@ def preprocess_data(ss, user_sheet_name):
     
     sleep_df['dateOfSleep'] = pd.to_datetime(sleep_df['dateOfSleep'])
     
+    # 睡眠データの数値化
     num_cols = ['minutesAsleep', 'efficiency', 'deep.minutes',
                 'rem.minutes', 'light.minutes', 'minutesToFallAsleep', 'timeInBed']
     for col in num_cols:
         sleep_df[col] = pd.to_numeric(sleep_df[col], errors='coerce').fillna(0)
     
+    # 就寝時刻を分に変換
     sleep_df['startTime'] = pd.to_datetime(sleep_df['startTime'])
     sleep_df['endTime'] = pd.to_datetime(sleep_df['endTime'])
     base_hour = 4
@@ -113,21 +114,50 @@ def preprocess_data(ss, user_sheet_name):
     bedtime_minutes = bedtime_minutes.apply(lambda x: x - 1440 if x > base_hour * 60 else x)
     sleep_df['bedtime_minutes'] = bedtime_minutes
     
-    hrv_df = get_sheet_data_as_df(ss, f"hrv_{user_sheet_name}")
-    rhr_df = get_sheet_data_as_df(ss, f"rhr_{user_sheet_name}")
+    # --- 他の指標データを読み込んでマージ ---
     
+    # HRV (hrv_user_XX)
+    hrv_df = get_sheet_data_as_df(ss, f"hrv_{user_sheet_name}")
     if hrv_df is not None and not hrv_df.empty:
         hrv_df['date'] = pd.to_datetime(hrv_df['date'])
         sleep_df = pd.merge(sleep_df, hrv_df[['date', 'dailyRmssd']], 
                            left_on='dateOfSleep', right_on='date', how='left')
         sleep_df['dailyRmssd'] = pd.to_numeric(sleep_df['dailyRmssd'], errors='coerce')
     
+    # RHR (rhr_user_XX)
+    rhr_df = get_sheet_data_as_df(ss, f"rhr_{user_sheet_name}")
     if rhr_df is not None and not rhr_df.empty:
         rhr_df['date'] = pd.to_datetime(rhr_df['date'])
         sleep_df = pd.merge(sleep_df, rhr_df[['date', 'restingHeartRate']], 
                            left_on='dateOfSleep', right_on='date', how='left')
         sleep_df['restingHeartRate'] = pd.to_numeric(sleep_df['restingHeartRate'], errors='coerce')
+
+    # SpO2 (spo2_user_XX)
+    spo2_df = get_sheet_data_as_df(ss, f"spo2_{user_sheet_name}")
+    if spo2_df is not None and not spo2_df.empty:
+        spo2_df['date'] = pd.to_datetime(spo2_df['date'])
+        # 'spo2_avg' 列を使用
+        sleep_df = pd.merge(sleep_df, spo2_df[['date', 'spo2_avg']], 
+                           left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df['spo2_avg'] = pd.to_numeric(sleep_df['spo2_avg'], errors='coerce')
+
+    # 呼吸数 (br_user_XX)
+    br_df = get_sheet_data_as_df(ss, f"br_{user_sheet_name}")
+    if br_df is not None and not br_df.empty:
+        br_df['date'] = pd.to_datetime(br_df['date'])
+        sleep_df = pd.merge(sleep_df, br_df[['date', 'breathingRate']], 
+                           left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df['breathingRate'] = pd.to_numeric(sleep_df['breathingRate'], errors='coerce')
+
+    # 皮膚温 (temp_user_XX)
+    temp_df = get_sheet_data_as_df(ss, f"temp_{user_sheet_name}")
+    if temp_df is not None and not temp_df.empty:
+        temp_df['date'] = pd.to_datetime(temp_df['date'])
+        sleep_df = pd.merge(sleep_df, temp_df[['date', 'tempVariation']], 
+                           left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df['tempVariation'] = pd.to_numeric(sleep_df['tempVariation'], errors='coerce')
     
+    # 睡眠の質を計算し、全データをfillna(0)
     sleep_df['sleep_quality'] = define_sleep_quality(sleep_df)
     sleep_df = sleep_df.fillna(0)
     
@@ -208,14 +238,19 @@ def analyze_trends(df):
     
     return trend_hrv, trend_deep
 
+# ★★★ 修正箇所 (v2.1) ★★★
 def get_key_factor(model, features):
     """モデルから最も重要な要因を取得"""
     importances = model.feature_importances_
+    # 新しい特徴量の日本語名を追加
     feature_names = {
         'bedtime_minutes': '就寝時刻のズレ',
         'timeInBed': 'ベッドにいた時間',
         'dailyRmssd': '心拍変動(HRV)',
-        'restingHeartRate': '安静時心拍数(RHR)'
+        'restingHeartRate': '安静時心P数(RHR)',
+        'spo2_avg': '睡眠中の平均SpO2',
+        'breathingRate': '睡眠中の呼吸数',
+        'tempVariation': '皮膚温の変化'
     }
     
     key_index = np.argmax(importances)
@@ -226,6 +261,7 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
     """プランB（推奨より1時間遅く寝た場合）をシミュレート"""
     plan_b_bedtime = best_bedtime + 60
     
+    # Plan Bの計算は粒度を荒く(15分)して計算負荷を下げる
     times_in_bed = np.arange(360, 540 + 15, 15)
     
     grid = []
@@ -249,12 +285,10 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
     return format_minutes_to_time(plan_b_bedtime), format_minutes_to_time(plan_b_waketime)
 
 # =================================================================
-# ML予測処理（変更なし）
+# ML予測処理
 # =================================================================
 
-# =================================================================
-# ML予測処理（★ 5分間隔 修正版 ★）
-# =================================================================
+# ★★★ 修正箇所 (v2.1) ★★★
 def predict_for_single_user(ss, user_sheet_name, target_date_str):
     """
     単一ユーザーの単一日付に対してML予測を実行する
@@ -269,6 +303,7 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             print(f"  ⚠️ データ不足: {user_sheet_name}")
             return False
         
+        # 予測対象日のデータを取得（分析用）
         today_data = df[df['dateOfSleep'] == pd.to_datetime(target_date_str)]
         today_hrv = 0
         today_rhr = 0
@@ -299,15 +334,32 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
         else:
             print(f"  🤖 機械学習モデルで予測 ({len(df)}日分のデータ)")
             
+            # --- 特徴量(features)と予測用平均値(avg_features)を動的に構築 ---
             features = ['bedtime_minutes', 'timeInBed']
             avg_features_for_pred = {}
             
+            # HRV
             if 'dailyRmssd' in df.columns and df['dailyRmssd'].sum() > 0:
                 features.append('dailyRmssd')
                 avg_features_for_pred['dailyRmssd'] = df['dailyRmssd'].tail(7).mean()
+            # RHR
             if 'restingHeartRate' in df.columns and df['restingHeartRate'].sum() > 0:
                 features.append('restingHeartRate')
                 avg_features_for_pred['restingHeartRate'] = df['restingHeartRate'].tail(7).mean()
+            # SpO2
+            if 'spo2_avg' in df.columns and df['spo2_avg'].sum() > 0:
+                features.append('spo2_avg')
+                avg_features_for_pred['spo2_avg'] = df['spo2_avg'].tail(7).mean()
+            # 呼吸数
+            if 'breathingRate' in df.columns and df['breathingRate'].sum() > 0:
+                features.append('breathingRate')
+                avg_features_for_pred['breathingRate'] = df['breathingRate'].tail(7).mean()
+            # 皮膚温 (0でないこともチェック)
+            if 'tempVariation' in df.columns and df['tempVariation'].sum() != 0:
+                features.append('tempVariation')
+                avg_features_for_pred['tempVariation'] = df['tempVariation'].tail(7).mean()
+            
+            print(f"  ℹ️  使用する特徴量: {features}")
             
             X = df[features].fillna(0)
             y = df['sleep_quality']
@@ -315,13 +367,12 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             model = RandomForestRegressor(n_estimators=100, random_state=42)
             model.fit(X, y)
             
-            # ★★★ ご要望⑥（推奨時間の粒度）の修正箇所 ★★★
-            # 5分間隔に変更
+            # --- 予測グリッドの作成 ---
+            # (5分間隔に変更)
             bedtimes = np.arange(-180, 120 + 5, 5)     # 21:00から02:00まで「5分」間隔
             times_in_bed = np.arange(360, 540 + 5, 5) # 6時間から9時間まで「5分」間隔
             print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
-            # ★★★
-            
+
             grid = []
             for bt in bedtimes:
                 for tib in times_in_bed:
@@ -329,10 +380,11 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             
             search_df = pd.DataFrame(grid)
             
+            # 平均値をグリッドに適用
             for feature, value in avg_features_for_pred.items():
                 search_df[feature] = value
             
-            search_df = search_df[features]
+            search_df = search_df[features] # モデルが学習した特徴量と順番を合わせる
             predictions = model.predict(search_df)
             
             best_index = predictions.argmax()
@@ -344,11 +396,10 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             best_waketime = best_bedtime + best_time_in_bed
             confidence = 'high' if len(df) > 90 else 'medium'
             
+            # --- 分析パート ---
             recovery_score = calculate_recovery_score(df, today_hrv, today_rhr)
             trend_hrv, trend_deep = analyze_trends(df)
             key_factor = get_key_factor(model, features)
-            
-            # Plan B のシミュレーションは、計算負荷を減らすため15分間隔のままにします
             plan_b_bedtime, plan_b_waketime = simulate_plan_b(model, features, avg_features_for_pred, best_bedtime)
         
         pred_bedtime_str = format_minutes_to_time(best_bedtime)
@@ -398,7 +449,7 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
         return False
 
 # =================================================================
-# ★★★ 修正版：ML予測キュー処理 ★★★
+# ★★★ v2 (1件処理) キュー処理 ★★★
 # =================================================================
 def process_prediction_queue(ss):
     """
@@ -406,7 +457,7 @@ def process_prediction_queue(ss):
     （Render.comのメモリ不足クラッシュ対策）
     """
     print("\n" + "="*70)
-    print("🔄 ML予測キュー処理を開始します (v2: 1件のみ処理)")
+    print("🔄 ML予測キュー処理を開始します (v2.1: 1件のみ処理)")
     print("="*70)
     
     try:
@@ -419,10 +470,8 @@ def process_prediction_queue(ss):
         }
     
     # --- 1. ヘッダーを読み込み、列のインデックスを動的に見つける ---
-    #    (列の順番が変わっても動くようにするため)
     try:
         headers = queue_sheet.row_values(1)
-        # gspreadは1-indexed
         status_col = headers.index('status') + 1
         sheet_name_col = headers.index('userSheetName') + 1
         target_date_col = headers.index('targetDate') + 1
@@ -440,7 +489,6 @@ def process_prediction_queue(ss):
     request = None
 
     for i, row in enumerate(all_values, start=2): # 2行目からスキャン
-        # status列 (0-indexed) が 'pending' かどうか
         if row[status_col - 1] == 'pending':
             target_row_index = i
             request = {
@@ -465,7 +513,7 @@ def process_prediction_queue(ss):
     
     # --- 4. 1件のジョブを実行 ---
     try:
-        # 4a. ジョブを「processing」にロックし、他のワーカーが重複処理しないようにする
+        # 4a. ジョブを「processing」にロック
         queue_sheet.update_cell(target_row_index, status_col, 'processing')
         
         # 4b. 重いML処理を実行
@@ -500,7 +548,6 @@ def process_prediction_queue(ss):
         print(f"❌ {error_msg}")
         traceback.print_exc()
         try:
-            # クラッシュした場合も、キューに「failed」と記録する
             queue_sheet.update_cell(target_row_index, status_col, 'failed')
             queue_sheet.update_cell(target_row_index, error_col, error_msg)
         except Exception as e_inner:
@@ -512,7 +559,7 @@ def process_prediction_queue(ss):
         }
 
 # =================================================================
-# Flaskエンドポイント（変更なし）
+# Flaskエンドポイント
 # =================================================================
 
 @app.route('/')
@@ -521,7 +568,7 @@ def home():
     return jsonify({
         'status': 'running',
         'service': 'Fitbit ML Prediction API',
-        'version': '2.0 (Stable)', # バージョンを更新
+        'version': '2.1 (Features: SpO2, BR, Temp)', # バージョンを更新
         'endpoints': {
             '/': 'ヘルスチェック',
             '/predict': 'ML予測キューを1件処理（POST）',
@@ -545,16 +592,14 @@ def predict():
     """
     try:
         print("\n" + "="*70)
-        print("📬 予測リクエストを受信しました (v2)")
+        print("📬 予測リクエストを受信しました (v2.1)")
         print("="*70)
         
-        # Google Sheetsクライアントを取得
         gc = get_gspread_client()
         ss = gc.open_by_key(SPREADSHEET_ID)
         
         print(f"✅ スプレッドシート「{ss.title}」を開きました")
         
-        # ★ 修正 ★ 1件のみ処理するキュー関数を呼び出す
         result = process_prediction_queue(ss)
         
         return jsonify({
@@ -579,8 +624,6 @@ def predict():
 # =================================================================
 
 if __name__ == '__main__':
-    # Render.comはPORT環境変数を自動で設定する
     port = int(os.environ.get('PORT', 10000))
-    print(f"\n🚀 Fitbit ML予測サービス v2 を起動します (ポート: {port})")
-    # debug=False は本番環境で重要
+    print(f"\n🚀 Fitbit ML予測サービス v2.1 を起動します (ポート: {port})")
     app.run(host='0.0.0.0', port=port, debug=False)
