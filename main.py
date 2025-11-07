@@ -1,6 +1,12 @@
 """
-Fitbit睡眠最適化ML予測サービス
+Fitbit睡眠最適化ML予測サービス (v2 - 安定版)
 Render.comで24時間稼働するFlaskアプリケーション
+
+変更点:
+- メモリ不足によるクラッシュを防ぐため、/predict が呼び出された際に
+  キュー(ML予測キュー)から1件だけ(pendingの最初の1件)を処理するように変更。
+- Cloud Scheduler (GCP) などで定期的に /predict を呼び出すことで、
+  キューに溜まったジョブを1件ずつ着実に処理する設計。
 """
 
 from flask import Flask, request, jsonify
@@ -13,6 +19,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import time
+import traceback # エラーログ出力用
 
 app = Flask(__name__)
 
@@ -20,7 +27,8 @@ app = Flask(__name__)
 # 設定
 # =================================================================
 
-SPREADSHEET_ID = '1ZGgw8i9ecNb__f8M8PLJY33NV76dzL5dFhg-e6rOQdc'
+# スプレッドシートIDを環境変数から取得（推奨）
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '1ZGgw8i9ecNb__f8M8PLJY33NV76dzL5dFhg-e6rOQdc')
 PREDICTION_SHEET_NAME = '睡眠最適化予測'
 QUEUE_SHEET_NAME = 'ML予測キュー'
 
@@ -31,9 +39,9 @@ QUEUE_SHEET_NAME = 'ML予測キュー'
 def get_gspread_client():
     """Google Sheets APIクライアントを取得"""
     try:
-        # 環境変数からサービスアカウントのJSONを取得
         creds_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
         if not creds_json:
+            print("❌ FATAL: GOOGLE_CREDENTIALS_JSON環境変数が設定されていません")
             raise Exception('GOOGLE_CREDENTIALS_JSON環境変数が設定されていません')
         
         creds_dict = json.loads(creds_json)
@@ -47,7 +55,7 @@ def get_gspread_client():
         raise
 
 # =================================================================
-# ヘルパー関数（Colabと同じ）
+# ヘルパー関数（変更なし）
 # =================================================================
 
 def get_sheet_data_as_df(ss, sheet_name):
@@ -144,7 +152,7 @@ def calculate_recovery_score(df, today_hrv, today_rhr):
     hrv_baseline = df['dailyRmssd'].tail(30).median()
     rhr_baseline = df['restingHeartRate'].tail(30).median()
     
-    if hrv_baseline == 0 or rhr_baseline == 0 or pd.isna(hrv_baseline) or pd.isna(rhr_baseline):
+    if pd.isna(hrv_baseline) or pd.isna(rhr_baseline) or hrv_baseline == 0 or rhr_baseline == 0:
         return "安定"
     
     hrv_score = (today_hrv / hrv_baseline) * 50 if hrv_baseline > 0 else 50
@@ -241,7 +249,7 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
     return format_minutes_to_time(plan_b_bedtime), format_minutes_to_time(plan_b_waketime)
 
 # =================================================================
-# ML予測処理
+# ML予測処理（変更なし）
 # =================================================================
 
 def predict_for_single_user(ss, user_sheet_name, target_date_str):
@@ -377,16 +385,19 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
         
     except Exception as e:
         print(f"  ❌ 予測処理でエラー: {e}")
-        import traceback
         traceback.print_exc()
         return False
 
+# =================================================================
+# ★★★ 修正版：ML予測キュー処理 ★★★
+# =================================================================
 def process_prediction_queue(ss):
     """
-    「ML予測キュー」シートを監視し、pendingステータスのリクエストを処理する
+    「ML予測キュー」シートを監視し、pendingステータスの「最初の1件」だけを処理する
+    （Render.comのメモリ不足クラッシュ対策）
     """
     print("\n" + "="*70)
-    print("🔄 ML予測キュー処理を開始します")
+    print("🔄 ML予測キュー処理を開始します (v2: 1件のみ処理)")
     print("="*70)
     
     try:
@@ -398,22 +409,39 @@ def process_prediction_queue(ss):
             'message': 'キューシートが見つかりません'
         }
     
-    queue_data = queue_sheet.get_all_records()
+    # --- 1. ヘッダーを読み込み、列のインデックスを動的に見つける ---
+    #    (列の順番が変わっても動くようにするため)
+    try:
+        headers = queue_sheet.row_values(1)
+        # gspreadは1-indexed
+        status_col = headers.index('status') + 1
+        sheet_name_col = headers.index('userSheetName') + 1
+        target_date_col = headers.index('targetDate') + 1
+        processed_at_col = headers.index('processedAt') + 1
+        error_col = headers.index('errorMessage') + 1
+    except ValueError as e:
+        error_msg = f"FATAL: '{QUEUE_SHEET_NAME}'シートのヘッダーが不正です。'{e.args[0]}'列が見つかりません。"
+        print(f"❌ {error_msg}")
+        return {'success': False, 'message': error_msg}
     
-    if not queue_data:
-        print("✅ 処理対象のキューがありません。")
-        return {
-            'success': True,
-            'message': '処理対象のキューがありません',
-            'processed': 0
-        }
+    # --- 2. 'pending' の「最初の1件」を探す ---
+    all_values = queue_sheet.get_all_values()[1:] # ヘッダー行(1行目)を除く
     
-    pending_requests = [
-        (idx + 2, row) for idx, row in enumerate(queue_data) 
-        if row.get('status', '').lower() == 'pending'
-    ]
-    
-    if not pending_requests:
+    target_row_index = -1 # シート上の実際の行番号 (2行目から)
+    request = None
+
+    for i, row in enumerate(all_values, start=2): # 2行目からスキャン
+        # status列 (0-indexed) が 'pending' かどうか
+        if row[status_col - 1] == 'pending':
+            target_row_index = i
+            request = {
+                'userSheetName': row[sheet_name_col - 1],
+                'targetDate': row[target_date_col - 1]
+            }
+            break # ★重要★ 最初の1件を見つけたらループを抜ける
+
+    # --- 3. 処理対象がなければ正常終了 ---
+    if not request:
         print("✅ pendingステータスのリクエストはありません。")
         return {
             'success': True,
@@ -421,60 +449,61 @@ def process_prediction_queue(ss):
             'processed': 0
         }
     
-    print(f"📋 処理対象: {len(pending_requests)}件のリクエスト\n")
+    user_sheet_name = request['userSheetName']
+    target_date_str = request['targetDate']
     
-    processed_count = 0
-    failed_count = 0
+    print(f"📋 処理対象 (1件のみ): {user_sheet_name} @ {target_date_str} (シート行: {target_row_index})")
     
-    for row_index, request in pending_requests:
-        user_sheet_name = request.get('userSheetName', '')
-        target_date_str = request.get('targetDate', '')
+    # --- 4. 1件のジョブを実行 ---
+    try:
+        # 4a. ジョブを「processing」にロックし、他のワーカーが重複処理しないようにする
+        queue_sheet.update_cell(target_row_index, status_col, 'processing')
         
-        if not user_sheet_name or not target_date_str:
-            print(f"⚠️ 無効なリクエスト (行: {row_index})")
-            continue
+        # 4b. 重いML処理を実行
+        success = predict_for_single_user(ss, user_sheet_name, target_date_str)
         
+        # 4c. 結果に応じてステータスを更新
+        if success:
+            queue_sheet.update_cell(target_row_index, status_col, 'completed')
+            queue_sheet.update_cell(target_row_index, processed_at_col, 
+                                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            print(f"  ✅ 成功: 1件")
+            return {
+                'success': True,
+                'processed': 1,
+                'failed': 0,
+                'total': 1
+            }
+        else:
+            queue_sheet.update_cell(target_row_index, status_col, 'failed')
+            queue_sheet.update_cell(target_row_index, error_col, 'データ不足または予測エラー')
+            print(f"  ❌ 失敗: 1件 (MLエラー)")
+            return {
+                'success': True, # スクリプト自体は成功
+                'processed': 0,
+                'failed': 1,
+                'total': 1
+            }
+
+    except Exception as e:
+        # 4d. スクリプト自体がクラッシュした場合のフェイルセーフ
+        error_msg = f"処理中に致命的なエラー (行: {target_row_index}): {str(e)}"
+        print(f"❌ {error_msg}")
+        traceback.print_exc()
         try:
-            status_col = 4
-            queue_sheet.update_cell(row_index, status_col, 'processing')
-            
-            success = predict_for_single_user(ss, user_sheet_name, target_date_str)
-            
-            if success:
-                queue_sheet.update_cell(row_index, status_col, 'completed')
-                processed_at_col = 5
-                queue_sheet.update_cell(row_index, processed_at_col, 
-                                      datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                processed_count += 1
-            else:
-                queue_sheet.update_cell(row_index, status_col, 'failed')
-                error_col = 6
-                queue_sheet.update_cell(row_index, error_col, 'データ不足または予測エラー')
-                failed_count += 1
-            
-            time.sleep(2)
+            # クラッシュした場合も、キューに「failed」と記録する
+            queue_sheet.update_cell(target_row_index, status_col, 'failed')
+            queue_sheet.update_cell(target_row_index, error_col, error_msg)
+        except Exception as e_inner:
+            print(f"  ❌ キューへのエラー書き込みにも失敗: {e_inner}")
         
-        except Exception as e:
-            print(f"❌ エラー発生: {e}")
-            queue_sheet.update_cell(row_index, status_col, 'failed')
-            failed_count += 1
-    
-    print(f"\n{'='*70}")
-    print(f"📊 処理結果")
-    print(f"{'='*70}")
-    print(f"  ✅ 成功: {processed_count}件")
-    print(f"  ❌ 失敗: {failed_count}件")
-    print(f"{'='*70}\n")
-    
-    return {
-        'success': True,
-        'processed': processed_count,
-        'failed': failed_count,
-        'total': processed_count + failed_count
-    }
+        return {
+            'success': False, # スクリプト自体が失敗
+            'message': error_msg
+        }
 
 # =================================================================
-# Flaskエンドポイント
+# Flaskエンドポイント（変更なし）
 # =================================================================
 
 @app.route('/')
@@ -483,10 +512,10 @@ def home():
     return jsonify({
         'status': 'running',
         'service': 'Fitbit ML Prediction API',
-        'version': '1.0',
+        'version': '2.0 (Stable)', # バージョンを更新
         'endpoints': {
             '/': 'ヘルスチェック',
-            '/predict': 'ML予測実行（POST）',
+            '/predict': 'ML予測キューを1件処理（POST）',
             '/health': 'サービスステータス'
         }
     })
@@ -501,10 +530,13 @@ def health():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """ML予測を実行するメインエンドポイント"""
+    """
+    ML予測を実行するメインエンドポイント
+    （Cloud Schedulerから呼び出される）
+    """
     try:
         print("\n" + "="*70)
-        print("📬 予測リクエストを受信しました")
+        print("📬 予測リクエストを受信しました (v2)")
         print("="*70)
         
         # Google Sheetsクライアントを取得
@@ -513,7 +545,7 @@ def predict():
         
         print(f"✅ スプレッドシート「{ss.title}」を開きました")
         
-        # キューベースの予測処理を実行
+        # ★ 修正 ★ 1件のみ処理するキュー関数を呼び出す
         result = process_prediction_queue(ss)
         
         return jsonify({
@@ -525,7 +557,6 @@ def predict():
     except Exception as e:
         error_msg = str(e)
         print(f"❌ エラーが発生しました: {error_msg}")
-        import traceback
         traceback.print_exc()
         
         return jsonify({
@@ -539,6 +570,8 @@ def predict():
 # =================================================================
 
 if __name__ == '__main__':
+    # Render.comはPORT環境変数を自動で設定する
     port = int(os.environ.get('PORT', 10000))
-    print(f"\n🚀 Fitbit ML予測サービスを起動します (ポート: {port})")
+    print(f"\n🚀 Fitbit ML予測サービス v2 を起動します (ポート: {port})")
+    # debug=False は本番環境で重要
     app.run(host='0.0.0.0', port=port, debug=False)
