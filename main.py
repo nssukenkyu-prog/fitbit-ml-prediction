@@ -91,6 +91,7 @@ def define_sleep_quality(df):
     return quality.fillna(0)
 
 # ★★★ 修正箇所 (v2.1) ★★★
+# ★★★ 修正箇所 (v2.2 - MergeError修正版) ★★★
 def preprocess_data(ss, user_sheet_name):
     """ユーザーデータを読み込み、前処理と結合を行う"""
     sleep_df = get_sheet_data_as_df(ss, f"sleep_{user_sheet_name}")
@@ -122,6 +123,7 @@ def preprocess_data(ss, user_sheet_name):
         hrv_df['date'] = pd.to_datetime(hrv_df['date'])
         sleep_df = pd.merge(sleep_df, hrv_df[['date', 'dailyRmssd']], 
                            left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df = sleep_df.drop(columns=['date']) # ★ 修正: 結合後に不要な'date'列を削除
         sleep_df['dailyRmssd'] = pd.to_numeric(sleep_df['dailyRmssd'], errors='coerce')
     
     # RHR (rhr_user_XX)
@@ -130,15 +132,16 @@ def preprocess_data(ss, user_sheet_name):
         rhr_df['date'] = pd.to_datetime(rhr_df['date'])
         sleep_df = pd.merge(sleep_df, rhr_df[['date', 'restingHeartRate']], 
                            left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df = sleep_df.drop(columns=['date']) # ★ 修正: 結合後に不要な'date'列を削除
         sleep_df['restingHeartRate'] = pd.to_numeric(sleep_df['restingHeartRate'], errors='coerce')
 
     # SpO2 (spo2_user_XX)
     spo2_df = get_sheet_data_as_df(ss, f"spo2_{user_sheet_name}")
     if spo2_df is not None and not spo2_df.empty:
         spo2_df['date'] = pd.to_datetime(spo2_df['date'])
-        # 'spo2_avg' 列を使用
         sleep_df = pd.merge(sleep_df, spo2_df[['date', 'spo2_avg']], 
                            left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df = sleep_df.drop(columns=['date']) # ★ 修正: 結合後に不要な'date'列を削除
         sleep_df['spo2_avg'] = pd.to_numeric(sleep_df['spo2_avg'], errors='coerce')
 
     # 呼吸数 (br_user_XX)
@@ -147,6 +150,7 @@ def preprocess_data(ss, user_sheet_name):
         br_df['date'] = pd.to_datetime(br_df['date'])
         sleep_df = pd.merge(sleep_df, br_df[['date', 'breathingRate']], 
                            left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df = sleep_df.drop(columns=['date']) # ★ 修正: 結合後に不要な'date'列を削除
         sleep_df['breathingRate'] = pd.to_numeric(sleep_df['breathingRate'], errors='coerce')
 
     # 皮膚温 (temp_user_XX)
@@ -155,6 +159,7 @@ def preprocess_data(ss, user_sheet_name):
         temp_df['date'] = pd.to_datetime(temp_df['date'])
         sleep_df = pd.merge(sleep_df, temp_df[['date', 'tempVariation']], 
                            left_on='dateOfSleep', right_on='date', how='left')
+        sleep_df = sleep_df.drop(columns=['date']) # ★ 修正: 結合後に不要な'date'列を削除
         sleep_df['tempVariation'] = pd.to_numeric(sleep_df['tempVariation'], errors='coerce')
     
     # 睡眠の質を計算し、全データをfillna(0)
