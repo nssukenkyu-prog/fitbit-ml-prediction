@@ -427,27 +427,28 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             model = RandomForestRegressor(n_estimators=100, random_state=42)
             model.fit(X, y)
             
-            # --- 予測グリッドの作成 (v3.0 - ユーザー希望時刻ベース) ---
-            target_bedtime_str = get_user_preferences(ss, user_sheet_name)
-            target_bedtime_minutes = None
-            if target_bedtime_str:
-                target_bedtime_minutes = convert_time_str_to_minutes(target_bedtime_str)
+# --- 予測グリッドの作成 (v3.0 - ユーザー希望時刻ベース) ---
+            target_bedtime_str = get_user_preferences(ss, user_sheet_name)
+            target_bedtime_minutes = None
+            if target_bedtime_str:
+                target_bedtime_minutes = convert_time_str_to_minutes(target_bedtime_str)
 
-            # 希望時刻が設定されている場合、その周辺(±60分)を探す
-            if target_bedtime_minutes is not None:
-                print(f"  ℹ️ ユーザー希望時刻 ({target_bedtime_str}) に基づいてグリッドを生成します。")
-                search_center = target_bedtime_minutes
-                search_radius = 60 # 希望時刻の前後60分
-                bedtimes = np.arange(search_center - search_radius, search_center + search_radius + 5, 5)
-            else:
-                # 未設定の場合、従来通りの広い範囲を探す
-                print(f"  ℹ️ ユーザー希望時刻が未設定のため、標準範囲でグリッドを生成します。")
-                bedtimes = np.arange(-180, 120 + 5, 5) # 21:00から02:00まで「5分」間隔
+            # 希望時刻が設定されている場合、その周辺(±60分)を探す
+            if target_bedtime_minutes is not None:
+                print(f"  ℹ️ ユーザー希望時刻 ({target_bedtime_str}) に基づいてグリッドを生成します。")
+                search_center = target_bedtime_minutes
+                search_radius = 60 # 希望時刻の前後60分
+                bedtimes = np.arange(search_center - search_radius, search_center + search_radius + 5, 5)
+            else:
+                # 未設定の場合、従来通りの広い範囲を探す
+                print(f"  ℹ️ ユーザー希望時刻が未設定のため、標準範囲でグリッドを生成します。")
+                bedtimes = np.arange(-180, 120 + 5, 5) # 21:00から02:00まで「5分」間隔
 
-            times_in_bed = np.arange(360, 540 + 5, 5) # 6時間から9時間まで「5分」間隔
-            print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
+            times_in_bed = np.arange(360, 540 + 5, 5) # 6時間から9時間まで「5分」間隔
+            print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
 
-            grid = []
+            grid = []
+
             for bt in bedtimes:
                 for tib in times_in_bed:
                     grid.append({'bedtime_minutes': bt, 'timeInBed': tib})
