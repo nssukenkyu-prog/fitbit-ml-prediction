@@ -173,7 +173,56 @@ def preprocess_data(ss, user_sheet_name):
     sleep_df = sleep_df.fillna(0)
     
     return sleep_df
+def get_user_preferences(ss, user_sheet_name):
+    """ユーザー管理シートからユーザーの設定（希望就寝時刻）を取得"""
+    try:
+        ws = ss.worksheet('ユーザー管理') # 'ユーザー管理'シートを開く
+        data = ws.get_all_values()
+        if len(data) <= 1:
+            return None
+            
+        df = pd.DataFrame(data[1:], columns=data[0])
+        
+        user_row = df[df['sheetName'] == user_sheet_name]
+        
+        if user_row.empty:
+            print(f"  ⚠️ [get_user_preferences] ユーザー管理シートに {user_sheet_name} が見つかりません。")
+            return None
 
+        # 'targetBedtime' 列（K列を想定）が存在するか確認
+        if 'targetBedtime' not in df.columns:
+             print(f"  ⚠️ [get_user_preferences] ユーザー管理シートに 'targetBedtime' 列がありません。（ステップ1を確認してください）")
+             return None
+
+        target_bedtime_str = user_row.iloc[0].get('targetBedtime')
+        
+        if not target_bedtime_str or target_bedtime_str == "":
+            print(f"  ℹ️ [get_user_preferences] {user_sheet_name} の希望就寝時刻が未設定です。")
+            return None
+            
+        print(f"  ℹ️ [get_user_preferences] {user_sheet_name} の希望就寝時刻「{target_bedtime_str}」を取得しました。")
+        return target_bedtime_str # "23:00" などの文字列
+
+    except Exception as e:
+        print(f"  ⚠️ [get_user_preferences] ユーザー設定の読み込みエラー: {e}")
+        return None
+
+def convert_time_str_to_minutes(time_str):
+    """ "HH:MM" 形式の文字列を、基準時間(4時)からの相対分に変換 """
+    try:
+        hours, minutes = map(int, time_str.split(':'))
+        total_minutes = hours * 60 + minutes
+        
+        # 基準時間（AM 4:00 = 240分）より大きい時刻は、前日の時刻として扱う (マイナス値にする)
+        base_hour = 4
+        if total_minutes > base_hour * 60:
+            total_minutes -= 1440 # 24 * 60
+            
+        return total_minutes # 例: "23:00" -> -60, "01:00" -> 60
+    except Exception as e:
+        print(f"  ⚠️ [convert_time_str_to_minutes] 時刻変換エラー: {time_str}, {e}")
+        return None
+        
 def format_minutes_to_time(minutes):
     """分をHH:MM形式に変換"""
     if np.isnan(minutes): 
@@ -378,13 +427,27 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             model = RandomForestRegressor(n_estimators=100, random_state=42)
             model.fit(X, y)
             
-            # --- 予測グリッドの作成 ---
-            # (5分間隔に変更)
-            bedtimes = np.arange(-180, 120 + 5, 5)     # 21:00から02:00まで「5分」間隔
-            times_in_bed = np.arange(360, 540 + 5, 5) # 6時間から9時間まで「5分」間隔
-            print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
+            # --- 予測グリッドの作成 (v3.0 - ユーザー希望時刻ベース) ---
+            target_bedtime_str = get_user_preferences(ss, user_sheet_name)
+            target_bedtime_minutes = None
+            if target_bedtime_str:
+                target_bedtime_minutes = convert_time_str_to_minutes(target_bedtime_str)
 
-            grid = []
+            # 希望時刻が設定されている場合、その周辺(±60分)を探す
+            if target_bedtime_minutes is not None:
+                print(f"  ℹ️ ユーザー希望時刻 ({target_bedtime_str}) に基づいてグリッドを生成します。")
+                search_center = target_bedtime_minutes
+                search_radius = 60 # 希望時刻の前後60分
+                bedtimes = np.arange(search_center - search_radius, search_center + search_radius + 5, 5)
+            else:
+                # 未設定の場合、従来通りの広い範囲を探す
+                print(f"  ℹ️ ユーザー希望時刻が未設定のため、標準範囲でグリッドを生成します。")
+                bedtimes = np.arange(-180, 120 + 5, 5) # 21:00から02:00まで「5分」間隔
+
+            times_in_bed = np.arange(360, 540 + 5, 5) # 6時間から9時間まで「5分」間隔
+            print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
+
+            grid = []
             for bt in bedtimes:
                 for tib in times_in_bed:
                     grid.append({'bedtime_minutes': bt, 'timeInBed': tib})
