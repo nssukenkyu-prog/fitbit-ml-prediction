@@ -1,10 +1,11 @@
 """
-Fitbit睡眠最適化ML予測サービス (v2.1 - 追加特徴量 対応版)
+Fitbit睡眠最適化ML予測サービス (v3.0 - 夜間データ派生特徴量追加版)
 Render.comで24時間稼働するFlaskアプリケーション
 
 変更点:
 - v2: メモリ不足対策として、キュー処理を1件ずつに変更。
 - v2.1: SpO2, 呼吸数(BR), 皮膚温(Temp)のデータを特徴量としてモデルに追加。
+- v3.0: 夜間データのみから16種類の派生特徴量を生成（曜日、季節性、移動平均、比率など）
 """
 
 from flask import Flask, request, jsonify
@@ -92,7 +93,10 @@ def define_sleep_quality(df):
     return quality.fillna(0)
 
 def preprocess_data(ss, user_sheet_name):
-    """ユーザーデータを読み込み、前処理と結合を行う"""
+    """
+    ★v3.0: 夜間データのみから派生特徴量を生成
+    ユーザーデータを読み込み、前処理と結合を行う
+    """
     sleep_df = get_sheet_data_as_df(ss, f"sleep_{user_sheet_name}")
     if sleep_df is None or sleep_df.empty:
         print(f"  [{user_sheet_name}] 睡眠データがありません。")
@@ -101,17 +105,75 @@ def preprocess_data(ss, user_sheet_name):
     sleep_df = sleep_df.drop_duplicates(subset=['dateOfSleep'], keep='last')
     sleep_df['dateOfSleep'] = pd.to_datetime(sleep_df['dateOfSleep'])
     
+    # 睡眠データの数値化
     num_cols = ['minutesAsleep', 'efficiency', 'deep.minutes',
-                'rem.minutes', 'light.minutes', 'minutesToFallAsleep', 'timeInBed']
+                'rem.minutes', 'light.minutes', 'minutesToFallAsleep', 
+                'timeInBed', 'wake.minutes', 'wake.count']
     for col in num_cols:
-        sleep_df[col] = pd.to_numeric(sleep_df[col], errors='coerce').fillna(0)
+        if col in sleep_df.columns:
+            sleep_df[col] = pd.to_numeric(sleep_df[col], errors='coerce').fillna(0)
     
+    # 就寝時刻を分に変換
     sleep_df['startTime'] = pd.to_datetime(sleep_df['startTime'])
     sleep_df['endTime'] = pd.to_datetime(sleep_df['endTime'])
     base_hour = 4
     bedtime_minutes = sleep_df['startTime'].dt.hour * 60 + sleep_df['startTime'].dt.minute
     bedtime_minutes = bedtime_minutes.apply(lambda x: x - 1440 if x > base_hour * 60 else x)
     sleep_df['bedtime_minutes'] = bedtime_minutes
+    
+    # ==========================================
+    # ★★★ 新規特徴量（夜間データから派生）★★★
+    # ==========================================
+    
+    # 1. 曜日（0=月曜, 6=日曜）
+    sleep_df['day_of_week'] = sleep_df['dateOfSleep'].dt.dayofweek
+    
+    # 2. 週末フラグ（金曜・土曜の夜）
+    sleep_df['is_weekend'] = sleep_df['day_of_week'].apply(lambda x: 1 if x >= 4 else 0)
+    
+    # 3. 月（季節性）
+    sleep_df['month'] = sleep_df['dateOfSleep'].dt.month
+    
+    # 4. 深睡眠の比率（%）
+    sleep_df['deep_ratio'] = (sleep_df['deep.minutes'] / sleep_df['minutesAsleep'] * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    
+    # 5. レム睡眠の比率（%）
+    sleep_df['rem_ratio'] = (sleep_df['rem.minutes'] / sleep_df['minutesAsleep'] * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    
+    # 6. 中途覚醒の深刻度（回数 × 時間）
+    if 'wake.count' in sleep_df.columns and 'wake.minutes' in sleep_df.columns:
+        sleep_df['wake_severity'] = sleep_df['wake.count'] * sleep_df['wake.minutes']
+    else:
+        sleep_df['wake_severity'] = 0
+    
+    # 7. 入眠速度
+    sleep_df['sleep_onset_speed'] = sleep_df['minutesToFallAsleep']
+    
+    # 8. 過去3日間の平均睡眠時間（移動平均）
+    sleep_df['sleep_3day_avg'] = sleep_df['minutesAsleep'].rolling(window=3, min_periods=1).mean()
+    
+    # 9. 過去7日間の睡眠時間の標準偏差（安定性指標）
+    sleep_df['sleep_7day_std'] = sleep_df['minutesAsleep'].rolling(window=7, min_periods=3).std().fillna(0)
+    
+    # 10. 前日との睡眠時間の差分
+    sleep_df['sleep_diff_prev_day'] = sleep_df['minutesAsleep'].diff().fillna(0)
+    
+    # 11. 就寝時刻の標準偏差（過去7日間）
+    sleep_df['bedtime_7day_std'] = sleep_df['bedtime_minutes'].rolling(window=7, min_periods=3).std().fillna(0)
+    
+    # 12. 連続睡眠不足日数（7時間未満）
+    sleep_df['sleep_deficit_streak'] = 0
+    deficit_count = 0
+    for idx in sleep_df.index:
+        if sleep_df.loc[idx, 'minutesAsleep'] < 420:  # 7時間 = 420分
+            deficit_count += 1
+        else:
+            deficit_count = 0
+        sleep_df.loc[idx, 'sleep_deficit_streak'] = deficit_count
+    
+    # ==========================================
+    # 既存の外部データマージ処理（HRV, RHR, SpO2等）
+    # ==========================================
     
     # HRV
     hrv_df = get_sheet_data_as_df(ss, f"hrv_{user_sheet_name}")
@@ -122,6 +184,12 @@ def preprocess_data(ss, user_sheet_name):
                            left_on='dateOfSleep', right_on='date', how='left')
         sleep_df = sleep_df.drop(columns=['date'])
         sleep_df['dailyRmssd'] = pd.to_numeric(sleep_df['dailyRmssd'], errors='coerce')
+        
+        # ★13. HRVの7日間移動平均
+        sleep_df['hrv_7day_avg'] = sleep_df['dailyRmssd'].rolling(window=7, min_periods=3).mean().fillna(0)
+        
+        # ★14. HRVの前日比
+        sleep_df['hrv_diff_prev_day'] = sleep_df['dailyRmssd'].diff().fillna(0)
     
     # RHR
     rhr_df = get_sheet_data_as_df(ss, f"rhr_{user_sheet_name}")
@@ -132,6 +200,9 @@ def preprocess_data(ss, user_sheet_name):
                            left_on='dateOfSleep', right_on='date', how='left')
         sleep_df = sleep_df.drop(columns=['date'])
         sleep_df['restingHeartRate'] = pd.to_numeric(sleep_df['restingHeartRate'], errors='coerce')
+        
+        # ★15. RHRの7日間移動平均
+        sleep_df['rhr_7day_avg'] = sleep_df['restingHeartRate'].rolling(window=7, min_periods=3).mean().fillna(0)
 
     # SpO2
     spo2_df = get_sheet_data_as_df(ss, f"spo2_{user_sheet_name}")
@@ -163,6 +234,7 @@ def preprocess_data(ss, user_sheet_name):
         sleep_df = sleep_df.drop(columns=['date'])
         sleep_df['tempVariation'] = pd.to_numeric(sleep_df['tempVariation'], errors='coerce')
     
+    # 睡眠の質を計算
     sleep_df['sleep_quality'] = define_sleep_quality(sleep_df)
     sleep_df = sleep_df.fillna(0)
     
@@ -296,8 +368,23 @@ def get_key_factor(model, features):
     feature_names = {
         'bedtime_minutes': '就寝時刻のズレ',
         'timeInBed': 'ベッドにいた時間',
+        'day_of_week': '曜日',
+        'is_weekend': '週末',
+        'month': '季節',
+        'deep_ratio': '深睡眠の比率',
+        'rem_ratio': 'レム睡眠の比率',
+        'wake_severity': '中途覚醒の深刻度',
+        'sleep_onset_speed': '入眠速度',
+        'sleep_3day_avg': '3日間平均睡眠時間',
+        'sleep_7day_std': '睡眠時間の安定性',
+        'sleep_diff_prev_day': '前日との睡眠時間差',
+        'bedtime_7day_std': '就寝時刻の安定性',
+        'sleep_deficit_streak': '連続睡眠不足日数',
         'dailyRmssd': '心拍変動(HRV)',
+        'hrv_7day_avg': 'HRVの7日間平均',
+        'hrv_diff_prev_day': 'HRVの前日比',
         'restingHeartRate': '安静時心拍数(RHR)',
+        'rhr_7day_avg': 'RHRの7日間平均',
         'spo2_avg': '睡眠中の平均SpO2',
         'breathingRate': '睡眠中の呼吸数',
         'tempVariation': '皮膚温の変化'
@@ -336,7 +423,10 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
 # =================================================================
 
 def predict_for_single_user(ss, user_sheet_name, target_date_str):
-    """単一ユーザーの単一日付に対してML予測を実行する"""
+    """
+    ★v3.0: 新規特徴量を使用した予測
+    単一ユーザーの単一日付に対してML予測を実行する
+    """
     try:
         print(f"\n{'─'*70}")
         print(f"🤖 予測処理: {user_sheet_name} - {target_date_str}")
@@ -377,26 +467,38 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
         else:
             print(f"  🤖 機械学習モデルで予測 ({len(df)}日分のデータ)")
             
-            features = ['bedtime_minutes', 'timeInBed']
+            # ★★★ 新規特徴量を含む候補リスト ★★★
+            feature_candidates = [
+                'bedtime_minutes', 'timeInBed',
+                'day_of_week', 'is_weekend', 'month',
+                'deep_ratio', 'rem_ratio', 'wake_severity',
+                'sleep_onset_speed', 'sleep_3day_avg', 'sleep_7day_std',
+                'sleep_diff_prev_day', 'bedtime_7day_std', 'sleep_deficit_streak',
+                'dailyRmssd', 'hrv_7day_avg', 'hrv_diff_prev_day',
+                'restingHeartRate', 'rhr_7day_avg',
+                'spo2_avg', 'breathingRate', 'tempVariation'
+            ]
+            
+            # 実際に存在し、データがある特徴量のみ使用
+            features = []
             avg_features_for_pred = {}
             
-            if 'dailyRmssd' in df.columns and df['dailyRmssd'].sum() > 0:
-                features.append('dailyRmssd')
-                avg_features_for_pred['dailyRmssd'] = df['dailyRmssd'].tail(7).mean()
-            if 'restingHeartRate' in df.columns and df['restingHeartRate'].sum() > 0:
-                features.append('restingHeartRate')
-                avg_features_for_pred['restingHeartRate'] = df['restingHeartRate'].tail(7).mean()
-            if 'spo2_avg' in df.columns and df['spo2_avg'].sum() > 0:
-                features.append('spo2_avg')
-                avg_features_for_pred['spo2_avg'] = df['spo2_avg'].tail(7).mean()
-            if 'breathingRate' in df.columns and df['breathingRate'].sum() > 0:
-                features.append('breathingRate')
-                avg_features_for_pred['breathingRate'] = df['breathingRate'].tail(7).mean()
-            if 'tempVariation' in df.columns and df['tempVariation'].sum() != 0:
-                features.append('tempVariation')
-                avg_features_for_pred['tempVariation'] = df['tempVariation'].tail(7).mean()
+            for feature in feature_candidates:
+                if feature in df.columns:
+                    # bedtime_minutes と timeInBed は予測時に変動させる
+                    if feature in ['bedtime_minutes', 'timeInBed']:
+                        features.append(feature)
+                    # カテゴリカル変数（曜日・月）
+                    elif feature in ['day_of_week', 'is_weekend', 'month']:
+                        features.append(feature)
+                        # 明日の値を後で設定（avg不要）
+                    # その他の数値特徴量
+                    elif df[feature].sum() != 0:
+                        features.append(feature)
+                        avg_features_for_pred[feature] = df[feature].tail(7).mean()
             
-            print(f"  ℹ️  使用する特徴量: {features}")
+            print(f"  ℹ️  使用する特徴量数: {len(features)}")
+            print(f"  ℹ️  特徴量: {features}")
             
             X = df[features].fillna(0)
             y = df['sleep_quality']
@@ -404,6 +506,7 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             model = RandomForestRegressor(n_estimators=100, random_state=42)
             model.fit(X, y)
             
+            # ユーザー希望時刻の取得
             target_bedtime_str = get_user_preferences(ss, user_sheet_name)
             target_bedtime_minutes = None
             if target_bedtime_str:
@@ -421,6 +524,13 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             times_in_bed = np.arange(360, 540 + 5, 5)
             print(f"  ℹ️  5分間隔で計算中 (計算パターン: {len(bedtimes) * len(times_in_bed)}件)")
 
+            # ★★★ 明日の日付情報を計算 ★★★
+            tomorrow = pd.to_datetime(target_date_str) + pd.Timedelta(days=1)
+            tomorrow_dow = tomorrow.dayofweek
+            tomorrow_is_weekend = 1 if tomorrow_dow >= 4 else 0
+            tomorrow_month = tomorrow.month
+
+            # グリッド作成
             grid = []
             for bt in bedtimes:
                 for tib in times_in_bed:
@@ -428,8 +538,17 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             
             search_df = pd.DataFrame(grid)
             
+            # 平均値を適用
             for feature, value in avg_features_for_pred.items():
                 search_df[feature] = value
+            
+            # ★★★ 明日の日付情報を設定 ★★★
+            if 'day_of_week' in features:
+                search_df['day_of_week'] = tomorrow_dow
+            if 'is_weekend' in features:
+                search_df['is_weekend'] = tomorrow_is_weekend
+            if 'month' in features:
+                search_df['month'] = tomorrow_month
             
             search_df = search_df[features]
             predictions = model.predict(search_df)
@@ -496,7 +615,7 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
 def process_prediction_queue(ss):
     """ML予測キューを監視し、pendingステータスの最初の1件だけを処理する"""
     print("\n" + "="*70)
-    print("🔄 ML予測キュー処理を開始します (v2.1: 1件のみ処理)")
+    print("🔄 ML予測キュー処理を開始します (v3.0: 新規特徴量対応)")
     print("="*70)
     
     try:
@@ -597,7 +716,7 @@ def home():
     return jsonify({
         'status': 'running',
         'service': 'Fitbit ML Prediction API',
-        'version': '2.1 (Features: SpO2, BR, Temp)',
+        'version': '3.0 (夜間データ派生特徴量追加版)',
         'endpoints': {
             '/': 'ヘルスチェック',
             '/predict': 'ML予測キューを1件処理（POST）',
@@ -619,7 +738,7 @@ def predict():
     """ML予測を実行するメインエンドポイント"""
     try:
         print("\n" + "="*70)
-        print("📬 予測リクエストを受信しました (v2.1)")
+        print("📬 予測リクエストを受信しました (v3.0)")
         print("="*70)
         
         gc = get_gspread_client()
@@ -661,18 +780,26 @@ def evaluate_model_performance(ss, user_sheet_name):
         print(f"  ⚠️ データ不足（{len(df) if df is not None else 0}日分）")
         return None
     
-    features = ['bedtime_minutes', 'timeInBed']
+    # ★★★ v3.0: 新規特徴量を含む評価 ★★★
+    feature_candidates = [
+        'bedtime_minutes', 'timeInBed',
+        'day_of_week', 'is_weekend', 'month',
+        'deep_ratio', 'rem_ratio', 'wake_severity',
+        'sleep_onset_speed', 'sleep_3day_avg', 'sleep_7day_std',
+        'sleep_diff_prev_day', 'bedtime_7day_std', 'sleep_deficit_streak',
+        'dailyRmssd', 'hrv_7day_avg', 'hrv_diff_prev_day',
+        'restingHeartRate', 'rhr_7day_avg',
+        'spo2_avg', 'breathingRate', 'tempVariation'
+    ]
     
-    if 'dailyRmssd' in df.columns and df['dailyRmssd'].sum() > 0:
-        features.append('dailyRmssd')
-    if 'restingHeartRate' in df.columns and df['restingHeartRate'].sum() > 0:
-        features.append('restingHeartRate')
-    if 'spo2_avg' in df.columns and df['spo2_avg'].sum() > 0:
-        features.append('spo2_avg')
-    if 'breathingRate' in df.columns and df['breathingRate'].sum() > 0:
-        features.append('breathingRate')
-    if 'tempVariation' in df.columns and df['tempVariation'].sum() != 0:
-        features.append('tempVariation')
+    features = []
+    for feature in feature_candidates:
+        if feature in df.columns and df[feature].sum() != 0:
+            features.append(feature)
+    
+    if len(features) < 2:
+        print(f"  ⚠️ 有効な特徴量が不足")
+        return None
     
     X = df[features].fillna(0)
     y = df['sleep_quality']
@@ -694,6 +821,7 @@ def evaluate_model_performance(ss, user_sheet_name):
     print(f"     RMSE: {rmse:.2f}")
     print(f"     MAE:  {mae:.2f}")
     print(f"     R²:   {r2:.3f}")
+    print(f"     特徴量数: {len(features)}")
     
     return {
         'rmse': float(rmse),
@@ -708,7 +836,7 @@ def evaluate():
     """モデル評価用エンドポイント"""
     try:
         print("\n" + "="*70)
-        print("📊 モデル評価リクエストを受信")
+        print("📊 モデル評価リクエストを受信 (v3.0)")
         print("="*70)
         
         gc = get_gspread_client()
@@ -759,5 +887,5 @@ def evaluate():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    print(f"\n🚀 Fitbit ML予測サービス v2.1 を起動します (ポート: {port})")
+    print(f"\n🚀 Fitbit ML予測サービス v3.0 を起動します (ポート: {port})")
     app.run(host='0.0.0.0', port=port, debug=False)
