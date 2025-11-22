@@ -708,7 +708,7 @@ if __name__ == '__main__':
 # ==========================================
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt  # ← この行を削除またはコメントアウト
 
 def evaluate_model_performance(ss, user_sheet_name):
     """
@@ -811,4 +811,3 @@ def evaluate():
             'success': False,
             'error': str(e)
         }), 500
-
