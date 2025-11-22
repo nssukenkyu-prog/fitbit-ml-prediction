@@ -702,3 +702,113 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     print(f"\n🚀 Fitbit ML予測サービス v2.1 を起動します (ポート: {port})")
     app.run(host='0.0.0.0', port=port, debug=False)
+
+# ==========================================
+# 【新規追加】モデル評価関数
+# ==========================================
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+
+def evaluate_model_performance(ss, user_sheet_name):
+    """
+    モデルの予測精度を評価する（クロスバリデーション）
+    """
+    print(f"\n{'='*70}")
+    print(f"📊 モデル評価: {user_sheet_name}")
+    print(f"{'='*70}")
+    
+    df = preprocess_data(ss, user_sheet_name)
+    if df is None or len(df) < 50:
+        print(f"  ⚠️ データ不足（{len(df) if df is not None else 0}日分）")
+        return None
+    
+    # 特徴量とターゲット
+    features = ['bedtime_minutes', 'timeInBed']
+    
+    # HRV
+    if 'dailyRmssd' in df.columns and df['dailyRmssd'].sum() > 0:
+        features.append('dailyRmssd')
+    # RHR
+    if 'restingHeartRate' in df.columns and df['restingHeartRate'].sum() > 0:
+        features.append('restingHeartRate')
+    # SpO2
+    if 'spo2_avg' in df.columns and df['spo2_avg'].sum() > 0:
+        features.append('spo2_avg')
+    # 呼吸数
+    if 'breathingRate' in df.columns and df['breathingRate'].sum() > 0:
+        features.append('breathingRate')
+    # 皮膚温
+    if 'tempVariation' in df.columns and df['tempVariation'].sum() != 0:
+        features.append('tempVariation')
+    
+    X = df[features].fillna(0)
+    y = df['sleep_quality']
+    
+    # 訓練データとテストデータに分割（8:2）
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    
+    # 現在のRandomForestモデルで学習
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    
+    # 予測
+    y_pred = model.predict(X_test)
+    
+    # 評価指標
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    print(f"\n  📈 評価結果:")
+    print(f"     RMSE (二乗平均平方根誤差): {rmse:.2f}")
+    print(f"     MAE  (平均絶対誤差):        {mae:.2f}")
+    print(f"     R²   (決定係数):            {r2:.3f}")
+    print(f"\n  💡 解釈:")
+    print(f"     - 予測誤差は平均 ±{mae:.1f}点")
+    print(f"     - モデルは睡眠質の変動の {r2*100:.1f}% を説明")
+    
+    return {
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
+        'model': model,
+        'features': features
+    }
+
+
+# GASから呼び出すためのエンドポイント
+@app.route('/evaluate', methods=['POST'])
+def evaluate():
+    """モデル評価用エンドポイント"""
+    try:
+        gc = get_gspread_client()
+        ss = gc.open_by_key(SPREADSHEET_ID)
+        
+        # 全ユーザーを評価
+        user_sheets = ['user_01', 'user_02', 'user_03']  # ←実際のシート名に変更
+        results = {}
+        
+        for sheet_name in user_sheets:
+            result = evaluate_model_performance(ss, sheet_name)
+            if result:
+                results[sheet_name] = {
+                    'rmse': result['rmse'],
+                    'mae': result['mae'],
+                    'r2': result['r2']
+                }
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
