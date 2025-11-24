@@ -394,8 +394,12 @@ def get_key_factor(model, features):
     key_name = features[key_index]
     return feature_names.get(key_name, key_name)
 
-def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
-    """プランB（推奨より1時間遅く寝た場合）をシミュレート"""
+# 既存の simulate_plan_b をこれに丸ごと置き換えてください
+def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime, target_date_str):
+    """
+    プランB（推奨より1時間遅く寝た場合）をシミュレート
+    ★修正: target_date_strを受け取り、日付関連の特徴量を追加
+    """
     plan_b_bedtime = best_bedtime + 60
     times_in_bed = np.arange(360, 540 + 15, 15)
     
@@ -405,10 +409,26 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
     
     search_df = pd.DataFrame(grid)
     
-    for feature in avg_features_for_pred:
+    # 数値系の平均値を適用
+    for feature, value in avg_features_for_pred.items():
         if feature not in search_df.columns:
-            search_df[feature] = avg_features_for_pred[feature]
-    
+            search_df[feature] = value
+
+    # ★★★ 修正追加: 日付情報の計算と適用 ★★★
+    # 明日の日付（起床日）を基準にする
+    tomorrow = pd.to_datetime(target_date_str) + pd.Timedelta(days=1)
+    tomorrow_dow = tomorrow.dayofweek
+    tomorrow_is_weekend = 1 if tomorrow_dow >= 4 else 0
+    tomorrow_month = tomorrow.month
+
+    if 'day_of_week' in features:
+        search_df['day_of_week'] = tomorrow_dow
+    if 'is_weekend' in features:
+        search_df['is_weekend'] = tomorrow_is_weekend
+    if 'month' in features:
+        search_df['month'] = tomorrow_month
+    # ★★★★★★★★★★★★★★★★★★★★★★★
+
     search_df = search_df[features]
     predictions_b = model.predict(search_df)
     best_index_b = predictions_b.argmax()
@@ -417,7 +437,6 @@ def simulate_plan_b(model, features, avg_features_for_pred, best_bedtime):
     plan_b_waketime = plan_b_bedtime + best_time_in_bed_b
     
     return format_minutes_to_time(plan_b_bedtime), format_minutes_to_time(plan_b_waketime)
-
 # =================================================================
 # ML予測処理
 # =================================================================
@@ -565,7 +584,7 @@ def predict_for_single_user(ss, user_sheet_name, target_date_str):
             recovery_score = calculate_recovery_score(df, today_hrv, today_rhr)
             trend_hrv, trend_deep = analyze_trends(df)
             key_factor = get_key_factor(model, features)
-            plan_b_bedtime, plan_b_waketime = simulate_plan_b(model, features, avg_features_for_pred, best_bedtime)
+            plan_b_bedtime, plan_b_waketime = simulate_plan_b(model, features, avg_features_for_pred, best_bedtime, target_date_str)
         
         pred_bedtime_str = format_minutes_to_time(best_bedtime)
         pred_waketime_str = format_minutes_to_time(best_waketime)
