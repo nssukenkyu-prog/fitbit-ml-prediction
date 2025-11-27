@@ -21,6 +21,7 @@ import os
 import json
 import time
 import traceback
+from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -29,6 +30,11 @@ app = Flask(__name__)
 # Structure: { 'user_sheet_name': { 'model': model, 'features': feature_list, 'avg_features': avg_dict, 'timestamp': datetime } }
 USER_MODEL_CACHE = {}
 CACHE_EXPIRATION_HOURS = 24
+
+# =================================================================
+# OpenAI Client
+# =================================================================
+openai_client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 # =================================================================
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '1ZGgw8i9ecNb__f8M8PLJY33NV76dzL5dFhg-e6rOQdc')
@@ -611,6 +617,190 @@ def process_prediction_queue(ss):
             queue_sheet.update_cell(target_row_index, error_col, error_msg)
         except: pass
         return {'success': False, 'message': error_msg}
+
+# =================================================================
+# 💬 Interactive Sleep Coach Endpoint
+# =================================================================
+@app.route('/chat', methods=['POST'])
+def chat_with_coach():
+    """
+    ユーザーからの質問に対して、直近の睡眠データを踏まえて回答する
+    """
+    try:
+        data = request.json
+        user_sheet_name = data.get('user_sheet_name')
+        user_message = data.get('message')
+        
+        if not user_sheet_name or not user_message:
+            return jsonify({'error': 'Missing user_sheet_name or message'}), 400
+
+        print(f"💬 Chat Request: {user_sheet_name} - {user_message}")
+
+        # 1. データ取得
+        client = get_gspread_client()
+        ss = client.open_by_key(SPREADSHEET_ID)
+        df = preprocess_data(ss, user_sheet_name)
+        
+        context_str = ""
+        if df is not None and not df.empty:
+            # 直近7日間のデータを抽出
+            recent_df = df.tail(7).copy()
+            
+            # 統計情報
+            avg_sleep = recent_df['minutesAsleep'].mean()
+            avg_deep = recent_df['deep.minutes'].mean()
+            avg_eff = recent_df['efficiency'].mean()
+            avg_hrv = recent_df['dailyRmssd'].mean() if 'dailyRmssd' in recent_df.columns else 0
+            
+            context_str = f"""
+【ユーザーの直近7日間の睡眠データ】
+- 平均睡眠時間: {int(avg_sleep)}分
+- 平均深睡眠: {int(avg_deep)}分
+- 平均睡眠効率: {int(avg_eff)}%
+- 平均HRV: {int(avg_hrv)}
+- 最新の睡眠日: {recent_df.iloc[-1]['dateOfSleep'].strftime('%Y-%m-%d')}
+- 最新の睡眠時間: {int(recent_df.iloc[-1]['minutesAsleep'])}分
+- 最新の評価: {int(recent_df.iloc[-1]['sleep_quality'])}点
+"""
+
+        # 2. プロンプト作成
+        system_prompt = """
+あなたはプロフェッショナルな睡眠コーチです。
+ユーザーの質問に対し、提供された睡眠データを根拠にして、親身かつ具体的なアドバイスを行ってください。
+データがない場合は、一般的なアドバイスを行いつつ、データの同期を確認するよう促してください。
+回答は日本語で、300文字以内で簡潔にまとめてください。
+"""
+        
+        user_prompt = f"""
+{context_str}
+
+【ユーザーの質問】
+{user_message}
+"""
+
+        # 3. OpenAI API呼び出し
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=400,
+            temperature=0.7
+        )
+        
+        reply = response.choices[0].message.content.strip()
+        return jsonify({'reply': reply})
+
+    except Exception as e:
+        print(f"❌ Chat Error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+# =================================================================
+# 🔍 Correlation Analysis Endpoint
+# =================================================================
+@app.route('/analyze_correlations', methods=['POST'])
+def analyze_correlations():
+    """
+    睡眠データと習慣の相関分析を行い、インサイトを提供する
+    """
+    try:
+        data = request.json
+        user_sheet_name = data.get('user_sheet_name')
+        
+        if not user_sheet_name:
+            return jsonify({'error': 'Missing user_sheet_name'}), 400
+
+        print(f"🔍 Analysis Request: {user_sheet_name}")
+
+        client = get_gspread_client()
+        ss = client.open_by_key(SPREADSHEET_ID)
+        df = preprocess_data(ss, user_sheet_name)
+        
+        if df is None or len(df) < 14:
+            return jsonify({'reply': 'データが不足しているため（14日分以上必要）、詳細な分析ができません。データを蓄積してから再度お試しください。'})
+
+        # 相関分析の対象カラム
+        target_cols = ['sleep_quality', 'minutesAsleep', 'deep.minutes', 'efficiency', 'dailyRmssd']
+        feature_cols = ['bedtime_minutes', 'timeInBed', 'restingHeartRate', 'tempVariation', 'breathingRate']
+        
+        # カラムが存在するか確認
+        available_targets = [c for c in target_cols if c in df.columns]
+        available_features = [c for c in feature_cols if c in df.columns]
+        
+        correlations = []
+        
+        for target in available_targets:
+            for feature in available_features:
+                if target == feature: continue
+                try:
+                    corr = df[target].corr(df[feature])
+                    if not np.isnan(corr) and abs(corr) >= 0.3: # 相関がある程度あるものだけ
+                        correlations.append({
+                            'target': target,
+                            'feature': feature,
+                            'value': corr
+                        })
+                except:
+                    pass
+        
+        # 相関データをテキスト化
+        corr_text = ""
+        if correlations:
+            # 相関の強い順にソート
+            correlations.sort(key=lambda x: abs(x['value']), reverse=True)
+            for c in correlations[:5]: # Top 5
+                relation = "正の相関（比例）" if c['value'] > 0 else "負の相関（反比例）"
+                corr_text += f"- {c['feature']} と {c['target']} : {relation} (係数 {c['value']:.2f})\n"
+        else:
+            corr_text = "特筆すべき強い相関は見つかりませんでした。"
+
+        # LLMでインサイト生成
+        system_prompt = """
+あなたはデータサイエンティスト兼睡眠コンサルタントです。
+ユーザーの睡眠データから算出された相関係数をもとに、ユーザーにとって有益な「気づき」を与えてください。
+専門用語（正の相関など）はなるべく噛み砕き、「〇〇すると××になりやすい傾向があります」のように伝えてください。
+"""
+        
+        user_prompt = f"""
+【分析対象ユーザー: {user_sheet_name}】
+データ期間: {len(df)}日間
+
+【検出された相関関係】
+{corr_text}
+
+【変数の説明】
+- bedtime_minutes: 就寝時刻（遅いほど値が大きい）
+- timeInBed: ベッドにいた時間
+- restingHeartRate: 安静時心拍数
+- tempVariation: 皮膚温の変化
+- sleep_quality: 睡眠の質スコア
+- minutesAsleep: 実際の睡眠時間
+- deep.minutes: 深い睡眠の時間
+- efficiency: 睡眠効率
+- dailyRmssd: HRV（ストレス回復力）
+
+このデータから、ユーザーが睡眠を改善するために意識すべきポイントを3点挙げてアドバイスしてください。
+"""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        reply = response.choices[0].message.content.strip()
+        return jsonify({'reply': reply})
+
+    except Exception as e:
+        print(f"❌ Analysis Error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET', 'POST'])
 def home():
